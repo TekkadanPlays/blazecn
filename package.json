@@ -1,0 +1,41 @@
+{
+  "name": "blazecn",
+  "version": "0.1.0",
+  "description": "A shadcn/ui-compatible component library for InfernoJS",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "inferno": ">=8.0.0",
+    "inferno-create-element": ">=8.0.0",
+    "tailwindcss": ">=4.0.0"
+  },
+  "dependencies": {
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^3.4.0"
+  },
+  "devDependencies": {
+    "inferno": "^8.2.3",
+    "inferno-create-element": "^8.2.3",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TekkadanPlays/blazecn"
+  },
+  "keywords": [
+    "inferno",
+    "infernojs",
+    "shadcn",
+    "ui",
+    "components",
+    "tailwindcss",
+    "cva",
+    "design-system"
+  ]
+}
