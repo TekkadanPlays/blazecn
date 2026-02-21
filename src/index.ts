@@ -52,7 +52,7 @@ export { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, Command
 export { Popover, PopoverTrigger, PopoverContent } from './Popover';
 export { HoverCard, HoverCardTrigger, HoverCardContent, HoverCardWrapper } from './HoverCard';
 export { Tooltip } from './Tooltip';
-export { toast, dismissToast, Toaster, type ToastData } from './Toast';
+export { toast, dismissToast, Toaster, type ToastData, type ToastType, type ToasterPosition, type ToastAction } from './Toast';
 
 // Layout
 export { ScrollArea } from './ScrollArea';
