@@ -3,19 +3,22 @@ import { createElement } from 'inferno-create-element';
 import { cn } from './utils';
 
 // ---------------------------------------------------------------------------
-// Sonner-style toast system for Inferno
+// Toast system for InfernoJS — clean rewrite
 //
-// Architecture modeled after sonner by Emil Kowalski.
-// Uses an Observer singleton that publishes individual toast events.
-// The Toaster component manages its own array and handles enter/exit
-// animations via CSS transforms and data attributes — never returns null
-// to prevent mount/unmount flicker during navigation.
+// Design principles:
+//   1. ONE source of truth: Toaster owns the toast array. Period.
+//   2. NO cross-component height sharing — Toaster measures after every
+//      render and computes offsets from the DOM directly.
+//   3. Each toast has a simple lifecycle: enter → visible → exit → remove.
+//      States never overlap.
+//   4. Timers live on the Toaster, not individual items. No stale closures.
+//   5. CSS handles all animation via transitions on transform/opacity.
 // ---------------------------------------------------------------------------
 
 const TOAST_LIFETIME = 4000;
-const VISIBLE_TOASTS = 3;
+const MAX_VISIBLE = 3;
 const GAP = 14;
-const TIME_BEFORE_UNMOUNT = 200;
+const EXIT_DURATION = 300;
 const TOAST_WIDTH = 356;
 const VIEWPORT_OFFSET = 32;
 
@@ -35,103 +38,94 @@ export interface ToastData {
   action?: ToastAction;
   cancel?: ToastAction;
   duration?: number;
-  delete?: boolean;
   dismissible?: boolean;
-  position?: ToasterPosition;
-}
-
-interface ToastToDismiss {
-  id: string | number;
-  dismiss: true;
 }
 
 // ---------------------------------------------------------------------------
-// Observer — singleton state manager (matches real Sonner architecture)
+// Internal extended type — tracks lifecycle state per toast
 // ---------------------------------------------------------------------------
 
-let toastsCounter = 1;
+interface InternalToast extends ToastData {
+  phase: 'enter' | 'visible' | 'exit';
+  createdAt: number;
+  remaining: number;   // ms left on auto-dismiss clock
+  pausedAt: number;    // timestamp when timer was paused, 0 if running
+}
+
+// ---------------------------------------------------------------------------
+// Observer — minimal pub/sub between toast() calls and Toaster
+// ---------------------------------------------------------------------------
+
+type ToastEvent =
+  | { kind: 'add'; toast: ToastData }
+  | { kind: 'update'; toast: ToastData }
+  | { kind: 'dismiss'; id: string | number }
+  | { kind: 'dismiss-all' };
+
+type Subscriber = (event: ToastEvent) => void;
+
+let idCounter = 1;
 
 class Observer {
-  subscribers: Array<(toast: ToastData | ToastToDismiss) => void> = [];
-  toasts: Array<ToastData> = [];
+  private subs: Subscriber[] = [];
 
-  subscribe = (subscriber: (toast: ToastData | ToastToDismiss) => void) => {
-    this.subscribers.push(subscriber);
-    return () => {
-      const idx = this.subscribers.indexOf(subscriber);
-      if (idx > -1) this.subscribers.splice(idx, 1);
-    };
-  };
+  subscribe(fn: Subscriber): () => void {
+    this.subs.push(fn);
+    return () => { this.subs = this.subs.filter((s) => s !== fn); };
+  }
 
-  publish = (data: ToastData | ToastToDismiss) => {
-    this.subscribers.forEach((sub) => sub(data));
-  };
+  private emit(event: ToastEvent) {
+    for (const fn of this.subs) fn(event);
+  }
 
-  addToast = (data: ToastData) => {
-    this.publish(data);
-    this.toasts = [...this.toasts, data];
-  };
-
-  create = (data: Partial<ToastData> & { message?: string; type?: ToastType }): string | number => {
+  create(data: Partial<ToastData> & { message?: string }): string | number {
     const { message, ...rest } = data;
-    const id = data.id ?? toastsCounter++;
-    const alreadyExists = this.toasts.find((t) => t.id === id);
+    const id = data.id ?? idCounter++;
     const dismissible = data.dismissible ?? true;
+    const toastData: ToastData = {
+      id,
+      type: rest.type || 'default',
+      title: message,
+      description: rest.description,
+      action: rest.action,
+      cancel: rest.cancel,
+      duration: rest.duration,
+      dismissible,
+    };
 
-    if (alreadyExists) {
-      this.toasts = this.toasts.map((t) => {
-        if (t.id === id) {
-          const updated = { ...t, ...rest, id, dismissible, title: message ?? t.title };
-          this.publish(updated);
-          return updated;
-        }
-        return t;
-      });
+    // If an id was explicitly provided, try to update in-place
+    if (data.id !== undefined) {
+      this.emit({ kind: 'update', toast: toastData });
     } else {
-      this.addToast({ title: message, ...rest, dismissible, id, type: rest.type || 'default' } as ToastData);
-    }
-
-    return id;
-  };
-
-  dismiss = (id?: string | number) => {
-    if (id) {
-      this.toasts = this.toasts.filter((t) => t.id !== id);
-      this.publish({ id, dismiss: true });
-    } else {
-      this.toasts.forEach((t) => this.publish({ id: t.id, dismiss: true }));
-      this.toasts = [];
+      this.emit({ kind: 'add', toast: toastData });
     }
     return id;
-  };
+  }
 
-  message = (message: string, data?: Partial<ToastData>) => this.create({ ...data, message });
-  success = (message: string, data?: Partial<ToastData>) => this.create({ ...data, message, type: 'success' });
-  error = (message: string, data?: Partial<ToastData>) => this.create({ ...data, message, type: 'error' });
-  info = (message: string, data?: Partial<ToastData>) => this.create({ ...data, message, type: 'info' });
-  warning = (message: string, data?: Partial<ToastData>) => this.create({ ...data, message, type: 'warning' });
-  loading = (message: string, data?: Partial<ToastData>) => this.create({ ...data, message, type: 'loading' });
+  dismiss(id?: string | number) {
+    if (id !== undefined) {
+      this.emit({ kind: 'dismiss', id });
+    } else {
+      this.emit({ kind: 'dismiss-all' });
+    }
+  }
 
-  promise = <T,>(
+  promise<T>(
     promise: Promise<T>,
     msgs: { loading: string; success: string; error: string },
-  ): Promise<T> => {
+  ): Promise<T> {
     const id = this.create({ message: msgs.loading, type: 'loading', duration: Infinity });
     promise
-      .then(() => {
-        this.create({ id, message: msgs.success, type: 'success', duration: TOAST_LIFETIME });
-      })
-      .catch(() => {
-        this.create({ id, message: msgs.error, type: 'error', duration: TOAST_LIFETIME });
-      });
+      .then(() => this.create({ id, message: msgs.success, type: 'success', duration: TOAST_LIFETIME }))
+      .catch(() => this.create({ id, message: msgs.error, type: 'error', duration: TOAST_LIFETIME }));
     return promise;
-  };
+  }
 }
 
-const ToastState = new Observer();
+const observer = new Observer();
 
 // ---------------------------------------------------------------------------
-// Public API — toast() function with method variants
+// Public API
 // ---------------------------------------------------------------------------
 
 interface ToastOptions {
@@ -140,29 +134,28 @@ interface ToastOptions {
   cancel?: ToastAction;
   duration?: number;
   id?: string | number;
-  position?: ToasterPosition;
 }
 
 function toastFn(title: string, opts?: ToastOptions): string | number {
-  return ToastState.create({ message: title, ...opts });
+  return observer.create({ message: title, ...opts });
 }
 
 export const toast = Object.assign(toastFn, {
-  success: (title: string, opts?: ToastOptions) => ToastState.create({ ...opts, message: title, type: 'success' as ToastType }),
-  error: (title: string, opts?: ToastOptions) => ToastState.create({ ...opts, message: title, type: 'error' as ToastType }),
-  info: (title: string, opts?: ToastOptions) => ToastState.create({ ...opts, message: title, type: 'info' as ToastType }),
-  warning: (title: string, opts?: ToastOptions) => ToastState.create({ ...opts, message: title, type: 'warning' as ToastType }),
-  loading: (title: string, opts?: ToastOptions) => ToastState.create({ ...opts, message: title, type: 'loading' as ToastType }),
-  dismiss: (id?: string | number) => ToastState.dismiss(id),
-  promise: ToastState.promise,
+  success: (title: string, opts?: ToastOptions) => observer.create({ ...opts, message: title, type: 'success' as ToastType }),
+  error:   (title: string, opts?: ToastOptions) => observer.create({ ...opts, message: title, type: 'error'   as ToastType }),
+  info:    (title: string, opts?: ToastOptions) => observer.create({ ...opts, message: title, type: 'info'    as ToastType }),
+  warning: (title: string, opts?: ToastOptions) => observer.create({ ...opts, message: title, type: 'warning' as ToastType }),
+  loading: (title: string, opts?: ToastOptions) => observer.create({ ...opts, message: title, type: 'loading' as ToastType }),
+  dismiss: (id?: string | number) => observer.dismiss(id),
+  promise: observer.promise.bind(observer),
 });
 
 export function dismissToast(id: string | number) {
-  ToastState.dismiss(id);
+  observer.dismiss(id);
 }
 
 // ---------------------------------------------------------------------------
-// Type icons (SVG) — wrapped in a 16×16 flex container matching real Sonner
+// Type icons
 // ---------------------------------------------------------------------------
 
 function ToastIcon({ type }: { type: ToastType }) {
@@ -218,180 +211,335 @@ function ToastIcon({ type }: { type: ToastType }) {
 }
 
 // ---------------------------------------------------------------------------
-// ToastItem — individual toast with height measurement and timer management
+// Toaster — the ONLY stateful component. Owns everything.
+//
+// All positioning is done with absolute positioning + transform.
+// Expanded (hover) mode: each toast offset = sum of measured heights above it.
+// Collapsed mode: front toast at offset 0, others peeking behind with scale.
 // ---------------------------------------------------------------------------
 
-interface ToastItemProps {
-  data: ToastData;
-  index: number;
-  toasts: ToastData[];
-  expanded: boolean;
-  interacting: boolean;
-  heights: Array<{ toastId: string | number; height: number; position?: string }>;
-  position: string;
-  gap: number;
-  removeToast: (t: ToastData) => void;
-  setHeights: (fn: (h: Array<{ toastId: string | number; height: number; position?: string }>) => Array<{ toastId: string | number; height: number; position?: string }>) => void;
+interface ToasterProps {
+  position?: ToasterPosition;
 }
 
-interface ToastItemState {
-  mounted: boolean;
-  removed: boolean;
-  offsetBeforeRemove: number;
-  initialHeight: number;
+interface ToasterState {
+  toasts: InternalToast[];
+  hovered: boolean;
 }
 
-class ToastItem extends Component<ToastItemProps, ToastItemState> {
-  declare state: ToastItemState;
-  private toastRef: HTMLLIElement | null = null;
-  private closeTimerStartRef = 0;
-  private lastCloseTimerStartRef = 0;
-  private remainingTime: number;
-  private timeoutId: ReturnType<typeof setTimeout> | null = null;
-  private deleteInProgress = false;
+export class Toaster extends Component<ToasterProps, ToasterState> {
+  declare state: ToasterState;
+  private unsub: (() => void) | null = null;
+  private tickId: ReturnType<typeof setInterval> | null = null;
+  private exitTimers = new Set<string | number>(); // IDs with pending removal timers
+  private heights = new Map<string | number, number>(); // measured heights per toast id
 
-  constructor(props: ToastItemProps) {
+  constructor(props: ToasterProps) {
     super(props);
-    this.remainingTime = props.data.duration ?? TOAST_LIFETIME;
-    this.state = { mounted: false, removed: false, offsetBeforeRemove: 0, initialHeight: 0 };
+    this.state = { toasts: [], hovered: false };
   }
 
   componentDidMount() {
-    requestAnimationFrame(() => this.setState({ mounted: true }));
-
-    if (this.toastRef) {
-      const h = this.toastRef.getBoundingClientRect().height;
-      this.setState({ initialHeight: h });
-      this.props.setHeights((prev) => [{ toastId: this.props.data.id, height: h, position: this.props.data.position || this.props.position }, ...prev]);
-    }
-
-    this.syncTimer();
-  }
-
-  componentDidUpdate(prevProps: ToastItemProps) {
-    if (prevProps.data.title !== this.props.data.title || prevProps.data.description !== this.props.data.description) {
-      if (this.toastRef) {
-        const h = this.toastRef.getBoundingClientRect().height;
-        this.setState({ initialHeight: h });
-        this.props.setHeights((prev) => {
-          const exists = prev.find((x) => x.toastId === this.props.data.id);
-          if (exists) return prev.map((x) => x.toastId === this.props.data.id ? { ...x, height: h } : x);
-          return [{ toastId: this.props.data.id, height: h, position: this.props.data.position || this.props.position }, ...prev];
-        });
-      }
-    }
-
-    if (this.props.data.delete && !prevProps.data.delete && !this.deleteInProgress) {
-      this.deleteToast();
-    }
-
-    if (prevProps.expanded !== this.props.expanded || prevProps.interacting !== this.props.interacting) {
-      this.syncTimer();
-    }
-
-    if (prevProps.data.type === 'loading' && this.props.data.type !== 'loading') {
-      this.remainingTime = this.props.data.duration ?? TOAST_LIFETIME;
-      this.syncTimer();
-    }
+    this.unsub = observer.subscribe((event) => this.handleEvent(event));
+    this.tickId = setInterval(() => this.tick(), 50);
   }
 
   componentWillUnmount() {
-    if (this.timeoutId) clearTimeout(this.timeoutId);
-    if (!this.deleteInProgress) {
-      this.props.setHeights((prev) => prev.filter((h) => h.toastId !== this.props.data.id));
-    }
+    this.unsub?.();
+    if (this.tickId) clearInterval(this.tickId);
+    this.exitTimers.clear();
+    this.heights.clear();
   }
 
-  private syncTimer() {
-    if (this.deleteInProgress) return;
-    if (this.props.data.type === 'loading' || this.props.data.duration === Infinity) return;
-    if (this.remainingTime === Infinity) return;
-
-    if (this.props.expanded || this.props.interacting) {
-      this.pauseTimer();
-    } else {
-      this.startTimer();
-    }
+  componentDidUpdate() {
+    // Measure all toast elements after render
+    this.measureHeights();
   }
 
-  private startTimer() {
-    if (this.deleteInProgress) return;
-    if (this.remainingTime <= 0) return;
-
-    if (this.timeoutId) clearTimeout(this.timeoutId);
-    this.closeTimerStartRef = Date.now();
-    this.timeoutId = setTimeout(() => this.deleteToast(), this.remainingTime);
-  }
-
-  private pauseTimer() {
-    if (this.timeoutId) { clearTimeout(this.timeoutId); this.timeoutId = null; }
-    if (this.lastCloseTimerStartRef < this.closeTimerStartRef) {
-      const elapsed = Date.now() - this.closeTimerStartRef;
-      this.remainingTime = Math.max(0, this.remainingTime - elapsed);
-    }
-    this.lastCloseTimerStartRef = Date.now();
-  }
-
-  private deleteToast() {
-    if (this.deleteInProgress) return;
-    this.deleteInProgress = true;
-
-    if (this.timeoutId) { clearTimeout(this.timeoutId); this.timeoutId = null; }
-
-    let capturedOffset = 0;
-    this.props.setHeights((prev) => {
-      const id = this.props.data.id;
-      const idx = prev.findIndex((h) => h.toastId === id);
-      if (idx >= 0) {
-        let sum = 0;
-        for (let i = 0; i < idx; i++) sum += prev[i].height;
-        capturedOffset = idx * this.props.gap + sum;
-      }
-      return prev.filter((h) => h.toastId !== id);
+  private measureHeights() {
+    const ol = (this as any)._listRef as HTMLOListElement | null;
+    if (!ol) return;
+    const items = ol.querySelectorAll('[data-toast-id]');
+    items.forEach((el: Element) => {
+      const rawId = el.getAttribute('data-toast-id')!;
+      const id: string | number = /^\d+$/.test(rawId) ? Number(rawId) : rawId;
+      const h = (el as HTMLElement).getBoundingClientRect().height;
+      if (h > 0) this.heights.set(id, h);
     });
-    this.setState({ removed: true, offsetBeforeRemove: capturedOffset });
-
-    setTimeout(() => this.props.removeToast(this.props.data), TIME_BEFORE_UNMOUNT);
   }
+
+  // -----------------------------------------------------------------------
+  // Event handler
+  // -----------------------------------------------------------------------
+
+  private handleEvent = (event: ToastEvent) => {
+    const now = Date.now();
+
+    if (event.kind === 'add') {
+      const d = event.toast;
+      const internal: InternalToast = {
+        ...d,
+        phase: 'enter',
+        createdAt: now,
+        remaining: d.duration ?? TOAST_LIFETIME,
+        pausedAt: 0,
+      };
+      this.setState((s) => ({ toasts: [internal, ...s.toasts] }));
+      requestAnimationFrame(() => {
+        this.setState((s) => ({
+          toasts: s.toasts.map((t) =>
+            t.id === d.id && t.phase === 'enter' ? { ...t, phase: 'visible' as const } : t,
+          ),
+        }));
+      });
+      return;
+    }
+
+    if (event.kind === 'update') {
+      const d = event.toast;
+      this.setState((s) => {
+        const idx = s.toasts.findIndex((t) => t.id === d.id);
+        if (idx === -1) {
+          // Not found — treat as add
+          const internal: InternalToast = {
+            ...d, phase: 'enter', createdAt: now,
+            remaining: d.duration ?? TOAST_LIFETIME, pausedAt: 0,
+          };
+          requestAnimationFrame(() => {
+            this.setState((s2) => ({
+              toasts: s2.toasts.map((t) =>
+                t.id === d.id && t.phase === 'enter' ? { ...t, phase: 'visible' as const } : t,
+              ),
+            }));
+          });
+          return { toasts: [internal, ...s.toasts] };
+        }
+        const existing = s.toasts[idx];
+        const wasLoading = existing.type === 'loading' && d.type !== 'loading';
+        const newRemaining = wasLoading
+          ? (d.duration ?? TOAST_LIFETIME)
+          : (d.duration !== undefined ? d.duration : existing.remaining);
+        const updated = [...s.toasts];
+        // Cancel any pending exit timer if we're reviving this toast
+        if (existing.phase === 'exit') {
+          this.exitTimers.delete(d.id);
+        }
+        updated[idx] = {
+          ...existing, ...d,
+          remaining: newRemaining,
+          pausedAt: 0,
+          createdAt: wasLoading ? now : existing.createdAt,
+          phase: existing.phase === 'exit' ? 'visible' as const : existing.phase,
+        };
+        return { toasts: updated };
+      });
+      return;
+    }
+
+    if (event.kind === 'dismiss') {
+      this.scheduleExit(event.id);
+      return;
+    }
+
+    if (event.kind === 'dismiss-all') {
+      this.setState((s) => ({
+        toasts: s.toasts.map((t) => t.phase !== 'exit' ? { ...t, phase: 'exit' as const } : t),
+      }));
+      // Collect all IDs for cleanup
+      for (const t of this.state.toasts) {
+        if (!this.exitTimers.has(t.id)) {
+          this.exitTimers.add(t.id);
+          setTimeout(() => this.removeToast(t.id), EXIT_DURATION);
+        }
+      }
+    }
+  };
+
+  // -----------------------------------------------------------------------
+  // Timer tick
+  // -----------------------------------------------------------------------
+
+  private tick() {
+    const now = Date.now();
+    const { hovered, toasts } = this.state;
+    let changed = false;
+
+    const next = toasts.map((t) => {
+      if (t.phase === 'exit' || t.phase === 'enter') return t;
+      if (t.type === 'loading' || t.remaining === Infinity) return t;
+
+      // Pause on hover
+      if (hovered) {
+        if (t.pausedAt === 0) {
+          changed = true;
+          return { ...t, pausedAt: now };
+        }
+        return t;
+      }
+
+      // Resume after hover
+      if (t.pausedAt > 0) {
+        changed = true;
+        return { ...t, pausedAt: 0, createdAt: now };
+      }
+
+      // Check expiry
+      const elapsed = now - t.createdAt;
+      if (elapsed >= t.remaining) {
+        changed = true;
+        // Schedule exit removal (only once)
+        if (!this.exitTimers.has(t.id)) {
+          this.exitTimers.add(t.id);
+          setTimeout(() => this.removeToast(t.id), EXIT_DURATION);
+        }
+        return { ...t, phase: 'exit' as const };
+      }
+
+      return t;
+    });
+
+    if (changed) {
+      this.setState({ toasts: next });
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Exit + removal helpers
+  // -----------------------------------------------------------------------
+
+  private scheduleExit(id: string | number) {
+    if (this.exitTimers.has(id)) return; // already exiting
+    this.exitTimers.add(id);
+    this.setState((s) => ({
+      toasts: s.toasts.map((t) =>
+        t.id === id && t.phase !== 'exit' ? { ...t, phase: 'exit' as const } : t,
+      ),
+    }));
+    setTimeout(() => this.removeToast(id), EXIT_DURATION);
+  }
+
+  private removeToast(id: string | number) {
+    this.exitTimers.delete(id);
+    this.heights.delete(id);
+    this.setState((s) => ({
+      toasts: s.toasts.filter((t) => t.id !== id),
+    }));
+  }
+
+  // -----------------------------------------------------------------------
+  // Render
+  // -----------------------------------------------------------------------
 
   render() {
-    const { data, index, toasts, expanded, heights, position, gap } = this.props;
-    const { mounted, removed, offsetBeforeRemove, initialHeight } = this.state;
-    const [yPos, xPos] = position.split('-');
+    const { toasts, hovered } = this.state;
+    const pos = this.props.position || 'bottom-right';
+    const [yPos, xPos] = pos.split('-');
+    const isTop = yPos === 'top';
 
-    const isFront = index === 0;
-    const isVisible = index + 1 <= VISIBLE_TOASTS;
+    // Always render the section shell so the Toaster is never unmounted
+    return createElement('section', {
+      'aria-label': 'Notifications',
+      tabIndex: -1,
+      'aria-live': 'polite',
+      style: { position: 'fixed', zIndex: 999999999, pointerEvents: 'none' },
+    },
+      toasts.length > 0
+        ? createElement('ol', {
+            ref: (el: HTMLOListElement | null) => { (this as any)._listRef = el; },
+            onMouseEnter: () => this.setState({ hovered: true }),
+            onMouseLeave: () => this.setState({ hovered: false }),
+            style: {
+              position: 'fixed',
+              listStyle: 'none',
+              padding: 0,
+              margin: 0,
+              width: `${TOAST_WIDTH}px`,
+              pointerEvents: 'auto',
+              ...(isTop ? { top: `${VIEWPORT_OFFSET}px` } : { bottom: `${VIEWPORT_OFFSET}px` }),
+              ...(xPos === 'left'
+                ? { left: `${VIEWPORT_OFFSET}px` }
+                : xPos === 'center'
+                  ? { left: '50%', transform: 'translateX(-50%)' }
+                  : { right: `${VIEWPORT_OFFSET}px` }),
+            } as any,
+          },
+            ...toasts.map((t, index) => this.renderToast(t, index, toasts, isTop, hovered)),
+          )
+        : null,
+    );
+  }
 
-    const heightIdx = heights.findIndex((h) => h.toastId === data.id);
-    const toastsHeightBefore = heights.reduce((prev, curr, i) => i >= heightIdx ? prev : prev + curr.height, 0);
-    const offset = removed ? offsetBeforeRemove : (heightIdx >= 0 ? heightIdx * gap + toastsHeightBefore : 0);
+  private renderToast(t: InternalToast, index: number, all: InternalToast[], isTop: boolean, hovered: boolean) {
+    const total = all.length;
+    const isVisible = index < MAX_VISIBLE;
+    const isExiting = t.phase === 'exit';
+    const isEntering = t.phase === 'enter';
+    const dir = isTop ? -1 : 1; // negative = up from bottom edge, positive = down from top
+
+    // Compute the expanded offset for this toast: sum of heights of toasts in front (index 0..index-1)
+    let expandedOffset = 0;
+    for (let i = 0; i < index; i++) {
+      const h = this.heights.get(all[i].id) ?? 56; // fallback 56px
+      expandedOffset += h + GAP;
+    }
+
+    let transform: string;
+    let opacity: number;
+    const zIndex = total - index;
+    const easing = 'cubic-bezier(0.16, 1, 0.3, 1)';
+    let transition = `transform 300ms ${easing}, opacity 200ms ease`;
+
+    if (isEntering) {
+      // Off-screen start position
+      transform = isTop ? `translateY(-80px)` : `translateY(80px)`;
+      opacity = 0;
+      transition = 'none'; // no transition on first frame
+    } else if (isExiting) {
+      // Slide out past edge + fade
+      const exitY = isTop ? -(expandedOffset + 80) : (expandedOffset + 80);
+      transform = `translateY(${exitY}px)`;
+      opacity = 0;
+    } else if (hovered || total === 1) {
+      // Expanded: stack upward (bottom) or downward (top)
+      const y = isTop ? expandedOffset : -expandedOffset;
+      transform = `translateY(${y}px)`;
+      opacity = 1;
+    } else if (index === 0) {
+      // Collapsed front
+      transform = 'translateY(0)';
+      opacity = 1;
+    } else if (isVisible) {
+      // Collapsed peek — subtle offset + scale
+      const peekY = isTop ? (index * 8) : -(index * 8);
+      const scale = 1 - index * 0.05;
+      transform = `translateY(${peekY}px) scale(${scale})`;
+      opacity = 1;
+    } else {
+      // Beyond MAX_VISIBLE: hidden
+      const peekY = isTop ? (MAX_VISIBLE * 8) : -(MAX_VISIBLE * 8);
+      transform = `translateY(${peekY}px) scale(${1 - MAX_VISIBLE * 0.05})`;
+      opacity = 0;
+    }
 
     return createElement('li', {
-      ref: (el: HTMLLIElement | null) => { this.toastRef = el; },
-      'data-sonner-toast': '',
-      'data-mounted': mounted,
-      'data-removed': removed,
-      'data-visible': isVisible,
-      'data-front': isFront,
-      'data-expanded': Boolean(expanded),
-      'data-type': data.type,
-      'data-y-position': yPos,
-      'data-x-position': xPos,
+      key: t.id,
+      'data-toast-id': String(t.id),
       role: 'alert',
-      tabIndex: 0,
       className: 'group',
       style: {
-        '--index': index,
-        '--toasts-before': index,
-        '--z-index': toasts.length - index,
-        '--offset': `${offset}px`,
-        '--initial-height': `${initialHeight}px`,
+        position: 'absolute',
+        width: '100%',
+        ...(isTop ? { top: 0 } : { bottom: 0 }),
+        zIndex,
+        transform,
+        opacity,
+        transition,
+        transformOrigin: isTop ? 'top center' : 'bottom center',
+        pointerEvents: isExiting ? 'none' : 'auto',
       } as any,
     },
       createElement('div', {
-        className: cn(
-          'relative flex w-full items-center gap-2 overflow-hidden rounded-xl border p-4 shadow-lg',
-        ),
+        className: 'relative flex w-full items-center gap-2 overflow-hidden rounded-xl border p-4 shadow-lg',
         style: {
           background: 'var(--popover)',
           color: 'var(--popover-foreground)',
@@ -399,40 +547,40 @@ class ToastItem extends Component<ToastItemProps, ToastItemState> {
           fontSize: '13px',
         },
       },
-        createElement(ToastIcon, { type: data.type }),
+        createElement(ToastIcon, { type: t.type }),
 
         createElement('div', { className: 'flex flex-col gap-0.5 flex-1 min-w-0' },
-          data.title
-            ? createElement('div', { className: 'font-medium leading-snug' }, data.title)
+          t.title
+            ? createElement('div', { className: 'font-medium leading-snug' }, t.title)
             : null,
-          data.description
-            ? createElement('div', { className: 'text-muted-foreground leading-snug', style: { fontSize: '12px' } }, data.description)
+          t.description
+            ? createElement('div', { className: 'text-muted-foreground leading-snug', style: { fontSize: '12px' } }, t.description)
             : null,
-          (data.action || data.cancel)
+          (t.action || t.cancel)
             ? createElement('div', { className: 'flex items-center gap-2 mt-1.5' },
-                data.action
+                t.action
                   ? createElement('button', {
                       type: 'button',
-                      onClick: () => { data.action!.onClick(); this.deleteToast(); },
+                      onClick: () => { t.action!.onClick(); this.scheduleExit(t.id); },
                       className: 'inline-flex items-center justify-center rounded-md text-xs font-medium h-6 px-2 bg-primary text-primary-foreground hover:bg-primary/90 transition-colors',
-                    }, data.action.label)
+                    }, t.action.label)
                   : null,
-                data.cancel
+                t.cancel
                   ? createElement('button', {
                       type: 'button',
-                      onClick: () => { data.cancel!.onClick(); this.deleteToast(); },
+                      onClick: () => { t.cancel!.onClick(); this.scheduleExit(t.id); },
                       className: 'inline-flex items-center justify-center rounded-md text-xs font-medium h-6 px-2 border hover:bg-accent transition-colors',
                       style: { borderColor: 'var(--border)', background: 'var(--popover)' },
-                    }, data.cancel.label)
+                    }, t.cancel.label)
                   : null,
               )
             : null,
         ),
 
-        (data.dismissible !== false)
+        (t.dismissible !== false)
           ? createElement('button', {
               type: 'button',
-              onClick: () => this.deleteToast(),
+              onClick: () => this.scheduleExit(t.id),
               className: cn(
                 'absolute top-1.5 right-1.5 rounded-full p-0.5 opacity-0 transition-opacity group-hover:opacity-100',
                 'outline-none focus-visible:opacity-100 focus-visible:ring-ring/50 focus-visible:ring-[3px]',
@@ -455,148 +603,6 @@ class ToastItem extends Component<ToastItemProps, ToastItemState> {
             )
           : null,
       ),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Toaster — mount once at root level, NEVER returns null
-// ---------------------------------------------------------------------------
-
-type HeightEntry = { toastId: string | number; height: number; position?: string };
-
-interface ToasterProps {
-  position?: ToasterPosition;
-}
-
-interface ToasterState {
-  toasts: ToastData[];
-  heights: HeightEntry[];
-  expanded: boolean;
-  interacting: boolean;
-}
-
-export class Toaster extends Component<ToasterProps, ToasterState> {
-  declare state: ToasterState;
-  private unsub: (() => void) | null = null;
-
-  constructor(props: ToasterProps) {
-    super(props);
-    this.state = { toasts: [], heights: [], expanded: false, interacting: false };
-  }
-
-  componentDidMount() {
-    this.unsub = ToastState.subscribe((incoming) => {
-      if ('dismiss' in incoming && incoming.dismiss) {
-        this.setState((s) => ({
-          toasts: s.toasts.map((t) => t.id === incoming.id ? { ...t, delete: true } : t),
-        }));
-        return;
-      }
-
-      const toast = incoming as ToastData;
-      this.setState((s) => {
-        const idx = s.toasts.findIndex((t) => t.id === toast.id);
-        if (idx !== -1) {
-          const updated = [...s.toasts];
-          updated[idx] = { ...updated[idx], ...toast };
-          return { toasts: updated };
-        }
-        return { toasts: [toast, ...s.toasts] };
-      });
-    });
-  }
-
-  componentDidUpdate(_prevProps: ToasterProps, prevState: ToasterState) {
-    if (this.state.toasts.length <= 1 && prevState.toasts.length > 1) {
-      this.setState({ expanded: false });
-    }
-  }
-
-  componentWillUnmount() {
-    this.unsub?.();
-  }
-
-  private removeToast = (toastToRemove: ToastData) => {
-    this.setState((s) => {
-      const existing = s.toasts.find((t) => t.id === toastToRemove.id);
-      if (existing && !existing.delete) {
-        ToastState.toasts = ToastState.toasts.filter((t) => t.id !== toastToRemove.id);
-      }
-      return { toasts: s.toasts.filter((t) => t.id !== toastToRemove.id) };
-    });
-  };
-
-  private setHeights = (fn: (prev: HeightEntry[]) => HeightEntry[]) => {
-    this.setState((s) => ({ heights: fn(s.heights) }));
-  };
-
-  render() {
-    const { toasts, heights, expanded, interacting } = this.state;
-    const defaultPosition = this.props.position || 'bottom-right';
-
-    const positionSet = new Set<string>([defaultPosition]);
-    toasts.forEach((t) => { if (t.position) positionSet.add(t.position); });
-    const positions = Array.from(positionSet);
-
-    return createElement('section', {
-      'aria-label': 'Notifications',
-      tabIndex: -1,
-      'aria-live': 'polite',
-      'aria-atomic': 'false',
-    },
-      ...positions.map((pos, posIdx) => {
-        const [y, x] = pos.split('-');
-        const groupToasts = toasts.filter((t) =>
-          (!t.position && posIdx === 0) || t.position === pos,
-        );
-        const groupHeights = heights.filter((h) =>
-          (!h.position && posIdx === 0) || h.position === pos,
-        );
-
-        if (groupToasts.length === 0) return null;
-
-        const frontHeight = groupHeights[0]?.height || 0;
-
-        return createElement('ol', {
-          key: pos,
-          'data-sonner-toaster': '',
-          'data-y-position': y,
-          'data-x-position': x,
-          style: {
-            '--front-toast-height': `${frontHeight}px`,
-            '--width': `${TOAST_WIDTH}px`,
-            '--gap': `${GAP}px`,
-            '--offset-top': `${VIEWPORT_OFFSET}px`,
-            '--offset-bottom': `${VIEWPORT_OFFSET}px`,
-            '--offset-left': `${VIEWPORT_OFFSET}px`,
-            '--offset-right': `${VIEWPORT_OFFSET}px`,
-          } as any,
-          onMouseEnter: () => this.setState({ expanded: true }),
-          onMouseMove: () => this.setState({ expanded: true }),
-          onMouseLeave: () => {
-            if (!interacting) this.setState({ expanded: false });
-          },
-          onPointerDown: () => this.setState({ interacting: true }),
-          onPointerUp: () => this.setState({ interacting: false }),
-        },
-          ...groupToasts.map((t, index) =>
-            createElement(ToastItem, {
-              key: t.id,
-              data: t,
-              index,
-              toasts: groupToasts,
-              expanded,
-              interacting,
-              heights: groupHeights,
-              position: pos,
-              gap: GAP,
-              removeToast: this.removeToast,
-              setHeights: this.setHeights,
-            }),
-          ),
-        );
-      }),
     );
   }
 }
