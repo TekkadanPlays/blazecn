@@ -17,6 +17,7 @@ import { cn } from './utils';
 
 const TOAST_LIFETIME = 4000;
 const MAX_VISIBLE = 3;
+const MAX_EXPANDED = 5;  // max toasts shown when hovered/expanded
 const GAP = 14;
 const EXIT_DURATION = 300;
 const TOAST_WIDTH = 356;
@@ -231,8 +232,9 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
   declare state: ToasterState;
   private unsub: (() => void) | null = null;
   private tickId: ReturnType<typeof setInterval> | null = null;
-  private exitTimers = new Set<string | number>(); // IDs with pending removal timers
-  private heights = new Map<string | number, number>(); // measured heights per toast id
+  private exitTimers = new Set<string | number>();
+  private heights = new Map<string | number, number>();
+  private leaveTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(props: ToasterProps) {
     super(props);
@@ -247,12 +249,12 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
   componentWillUnmount() {
     this.unsub?.();
     if (this.tickId) clearInterval(this.tickId);
+    if (this.leaveTimer) clearTimeout(this.leaveTimer);
     this.exitTimers.clear();
     this.heights.clear();
   }
 
   componentDidUpdate() {
-    // Measure all toast elements after render
     this.measureHeights();
   }
 
@@ -267,6 +269,22 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
       if (h > 0) this.heights.set(id, h);
     });
   }
+
+  // Debounced hover: enter immediately, leave after a short delay.
+  // This prevents flicker when the cursor crosses gaps between toasts
+  // or when a toast exits and the DOM reflows.
+  private onHoverEnter = () => {
+    if (this.leaveTimer) { clearTimeout(this.leaveTimer); this.leaveTimer = null; }
+    if (!this.state.hovered) this.setState({ hovered: true });
+  };
+
+  private onHoverLeave = () => {
+    if (this.leaveTimer) clearTimeout(this.leaveTimer);
+    this.leaveTimer = setTimeout(() => {
+      this.leaveTimer = null;
+      this.setState({ hovered: false });
+    }, 80);
+  };
 
   // -----------------------------------------------------------------------
   // Event handler
@@ -430,13 +448,38 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
   // Render
   // -----------------------------------------------------------------------
 
+  // Compute total expanded stack height for the hover overlay
+  private getExpandedHeight(toasts: InternalToast[]): number {
+    const count = Math.min(toasts.filter((t) => t.phase !== 'exit').length, MAX_EXPANDED);
+    let total = 0;
+    let shown = 0;
+    for (const t of toasts) {
+      if (t.phase === 'exit') continue;
+      if (shown >= count) break;
+      total += (this.heights.get(t.id) ?? 56) + (shown > 0 ? GAP : 0);
+      shown++;
+    }
+    return total;
+  }
+
   render() {
     const { toasts, hovered } = this.state;
     const pos = this.props.position || 'bottom-right';
     const [yPos, xPos] = pos.split('-');
     const isTop = yPos === 'top';
 
-    // Always render the section shell so the Toaster is never unmounted
+    // Position styles shared between the ol and the hover overlay
+    const anchor: Record<string, string> = {
+      position: 'fixed',
+      width: `${TOAST_WIDTH}px`,
+      ...(isTop ? { top: `${VIEWPORT_OFFSET}px` } : { bottom: `${VIEWPORT_OFFSET}px` }),
+      ...(xPos === 'left'
+        ? { left: `${VIEWPORT_OFFSET}px` }
+        : xPos === 'center'
+          ? { left: '50%', transform: 'translateX(-50%)' }
+          : { right: `${VIEWPORT_OFFSET}px` }),
+    };
+
     return createElement('section', {
       'aria-label': 'Notifications',
       tabIndex: -1,
@@ -444,26 +487,37 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
       style: { position: 'fixed', zIndex: 999999999, pointerEvents: 'none' },
     },
       toasts.length > 0
-        ? createElement('ol', {
-            ref: (el: HTMLOListElement | null) => { (this as any)._listRef = el; },
-            onMouseEnter: () => this.setState({ hovered: true }),
-            onMouseLeave: () => this.setState({ hovered: false }),
-            style: {
-              position: 'fixed',
-              listStyle: 'none',
-              padding: 0,
-              margin: 0,
-              width: `${TOAST_WIDTH}px`,
-              pointerEvents: 'auto',
-              ...(isTop ? { top: `${VIEWPORT_OFFSET}px` } : { bottom: `${VIEWPORT_OFFSET}px` }),
-              ...(xPos === 'left'
-                ? { left: `${VIEWPORT_OFFSET}px` }
-                : xPos === 'center'
-                  ? { left: '50%', transform: 'translateX(-50%)' }
-                  : { right: `${VIEWPORT_OFFSET}px` }),
-            } as any,
-          },
-            ...toasts.map((t, index) => this.renderToast(t, index, toasts, isTop, hovered)),
+        ? createElement('div', null,
+            // Invisible hover overlay: covers the full expanded stack area.
+            // This prevents hover flicker when cursor crosses gaps between
+            // absolute-positioned toasts or when a toast exits mid-hover.
+            createElement('div', {
+              onMouseEnter: this.onHoverEnter,
+              onMouseLeave: this.onHoverLeave,
+              style: {
+                ...anchor,
+                height: hovered
+                  ? `${this.getExpandedHeight(toasts) + GAP}px`
+                  : `${(this.heights.get(toasts[0]?.id) ?? 56) + MAX_VISIBLE * 6 + GAP}px`,
+                pointerEvents: 'auto',
+                zIndex: 999999998,
+                // Debug: uncomment to see the hover zone
+                // background: 'rgba(255,0,0,0.1)',
+              } as any,
+            }),
+            // The actual toast list
+            createElement('ol', {
+              ref: (el: HTMLOListElement | null) => { (this as any)._listRef = el; },
+              style: {
+                ...anchor,
+                listStyle: 'none',
+                padding: 0,
+                margin: 0,
+                pointerEvents: 'auto',
+              } as any,
+            },
+              ...toasts.map((t, index) => this.renderToast(t, index, toasts, isTop, hovered)),
+            ),
           )
         : null,
     );
@@ -504,11 +558,21 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
         ? `translateY(${-(expandedOffset + 80)}px)`
         : `translateY(${expandedOffset + 80}px)`;
       opacity = 0;
-    } else if (hovered) {
-      // Expanded: full stack with measured heights
+    } else if (hovered && index < MAX_EXPANDED) {
+      // Expanded: visible toasts stack with measured heights
       const y = isTop ? expandedOffset : -expandedOffset;
       transform = `translateY(${y}px)`;
       opacity = 1;
+    } else if (hovered && index >= MAX_EXPANDED) {
+      // Beyond expanded cap: hidden at the last expanded position
+      let capOffset = 0;
+      for (let i = 0; i < MAX_EXPANDED; i++) {
+        const h = this.heights.get(all[i].id) ?? 56;
+        capOffset += h + GAP;
+      }
+      const y = isTop ? capOffset : -capOffset;
+      transform = `translateY(${y}px)`;
+      opacity = 0;
     } else if (index === 0) {
       // Front toast — sits at anchor
       transform = 'translateY(0)';
