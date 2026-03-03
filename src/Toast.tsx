@@ -487,33 +487,31 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
       style: { position: 'fixed', zIndex: 999999999, pointerEvents: 'none' },
     },
       toasts.length > 0
-        ? createElement('div', null,
-            // Invisible hover overlay: covers the full expanded stack area.
-            // This prevents hover flicker when cursor crosses gaps between
-            // absolute-positioned toasts or when a toast exits mid-hover.
-            createElement('div', {
-              onMouseEnter: this.onHoverEnter,
-              onMouseLeave: this.onHoverLeave,
-              style: {
-                ...anchor,
-                height: hovered
-                  ? `${this.getExpandedHeight(toasts) + GAP}px`
-                  : `${(this.heights.get(toasts[0]?.id) ?? 56) + MAX_VISIBLE * 6 + GAP}px`,
-                pointerEvents: 'auto',
-                zIndex: 999999998,
-                // Debug: uncomment to see the hover zone
-                // background: 'rgba(255,0,0,0.1)',
-              } as any,
-            }),
-            // The actual toast list
+        ? createElement('div', {
+            // This wrapper catches all mouse events for the entire toast region.
+            // It's sized to cover the full stack area so cursor movement between
+            // absolute-positioned toasts (gap space) doesn't trigger leave/enter.
+            onMouseEnter: this.onHoverEnter,
+            onMouseLeave: this.onHoverLeave,
+            style: {
+              ...anchor,
+              height: hovered
+                ? `${this.getExpandedHeight(toasts) + GAP}px`
+                : `${(this.heights.get(toasts[0]?.id) ?? 56) + MAX_VISIBLE * 6 + GAP}px`,
+              pointerEvents: 'auto',
+              // Debug: uncomment to see the hover zone
+              // background: 'rgba(255,0,0,0.08)',
+            } as any,
+          },
             createElement('ol', {
               ref: (el: HTMLOListElement | null) => { (this as any)._listRef = el; },
               style: {
-                ...anchor,
+                position: 'absolute',
                 listStyle: 'none',
                 padding: 0,
                 margin: 0,
-                pointerEvents: 'auto',
+                width: '100%',
+                ...(isTop ? { top: 0 } : { bottom: 0 }),
               } as any,
             },
               ...toasts.map((t, index) => this.renderToast(t, index, toasts, isTop, hovered)),
