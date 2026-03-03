@@ -536,11 +536,30 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
     const isExiting = t.phase === 'exit';
     const isEntering = t.phase === 'enter';
 
-    // Expanded offset: sum of measured heights of toasts in front
+    // Compute a "live index" that ignores exiting toasts.
+    // This prevents follow-up toasts from inheriting dead space
+    // when the toast that triggered them is still animating out.
+    let liveIndex = 0;
+    for (let i = 0; i < index; i++) {
+      if (all[i].phase !== 'exit') liveIndex++;
+    }
+
+    // Expanded offset: sum of heights of LIVE toasts in front only
     let expandedOffset = 0;
     for (let i = 0; i < index; i++) {
+      if (all[i].phase === 'exit') continue;
       const h = this.heights.get(all[i].id) ?? 56;
       expandedOffset += h + GAP;
+    }
+
+    // Cap offset: sum of heights of first MAX_EXPANDED live toasts
+    let capOffset = 0;
+    let capCount = 0;
+    for (const toast of all) {
+      if (toast.phase === 'exit') continue;
+      if (capCount >= MAX_EXPANDED) break;
+      capOffset += (this.heights.get(toast.id) ?? 56) + (capCount > 0 ? GAP : 0);
+      capCount++;
     }
 
     let transform: string;
@@ -549,52 +568,49 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
     const easing = 'cubic-bezier(0.16, 1, 0.3, 1)';
     let transition = `transform 300ms ${easing}, opacity 200ms ease`;
 
-    // Collapsed stacking constants (matches real Sonner behavior):
-    // - Each toast behind the front peeks by ~6px
-    // - Very subtle scale reduction (2% per level)
-    // - Only MAX_VISIBLE toasts shown; rest hidden at last visible position
-    const PEEK = 6;    // px of card edge visible per level
-    const SCALE = 0.02; // scale reduction per level
+    const PEEK = 6;
+    const SCALE = 0.02;
 
     if (isEntering) {
       transform = isTop ? 'translateY(-80px)' : 'translateY(80px)';
       opacity = 0;
       transition = 'none';
     } else if (isExiting) {
-      // Slide away from the stack edge
+      // Slide away from anchor edge
       transform = isTop
         ? `translateY(${-(expandedOffset + 80)}px)`
         : `translateY(${expandedOffset + 80}px)`;
       opacity = 0;
-    } else if (hovered && index < MAX_EXPANDED) {
+    } else if (hovered && liveIndex < MAX_EXPANDED) {
       // Expanded: visible toasts stack with measured heights
       const y = isTop ? expandedOffset : -expandedOffset;
       transform = `translateY(${y}px)`;
-      opacity = 1;
-    } else if (hovered && index >= MAX_EXPANDED) {
-      // Beyond expanded cap: hidden at the last expanded position
-      let capOffset = 0;
-      for (let i = 0; i < MAX_EXPANDED; i++) {
-        const h = this.heights.get(all[i].id) ?? 56;
-        capOffset += h + GAP;
+      // Soft fade on the last expanded toast (tail fade)
+      if (liveIndex === MAX_EXPANDED - 1 && capCount >= MAX_EXPANDED) {
+        opacity = 0.5;
+      } else {
+        opacity = 1;
       }
+    } else if (hovered && liveIndex >= MAX_EXPANDED) {
+      // Beyond expanded cap: parked at cap offset, invisible
       const y = isTop ? capOffset : -capOffset;
       transform = `translateY(${y}px)`;
       opacity = 0;
-    } else if (index === 0) {
+    } else if (liveIndex === 0 && !isExiting) {
       // Front toast — sits at anchor
       transform = 'translateY(0)';
       opacity = 1;
-    } else if (index < MAX_VISIBLE) {
-      // Collapsed visible: peek behind front with subtle scale
-      const peekY = (isTop ? 1 : -1) * index * PEEK;
-      const scale = 1 - index * SCALE;
+    } else if (liveIndex < MAX_VISIBLE && !isExiting) {
+      // Collapsed peek behind front
+      const peekY = (isTop ? 1 : -1) * liveIndex * PEEK;
+      const scale = 1 - liveIndex * SCALE;
       transform = `translateY(${peekY}px) scale(${scale})`;
       opacity = 1;
     } else {
-      // Hidden: parked at the last visible position, fully transparent
-      const peekY = (isTop ? 1 : -1) * (MAX_VISIBLE - 1) * PEEK;
-      const scale = 1 - (MAX_VISIBLE - 1) * SCALE;
+      // Hidden (beyond MAX_VISIBLE or exiting without explicit exit branch)
+      const clamp = Math.min(liveIndex, MAX_VISIBLE - 1);
+      const peekY = (isTop ? 1 : -1) * clamp * PEEK;
+      const scale = 1 - clamp * SCALE;
       transform = `translateY(${peekY}px) scale(${scale})`;
       opacity = 0;
     }
