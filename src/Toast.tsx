@@ -471,15 +471,13 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
 
   private renderToast(t: InternalToast, index: number, all: InternalToast[], isTop: boolean, hovered: boolean) {
     const total = all.length;
-    const isVisible = index < MAX_VISIBLE;
     const isExiting = t.phase === 'exit';
     const isEntering = t.phase === 'enter';
-    const dir = isTop ? -1 : 1; // negative = up from bottom edge, positive = down from top
 
-    // Compute the expanded offset for this toast: sum of heights of toasts in front (index 0..index-1)
+    // Expanded offset: sum of measured heights of toasts in front
     let expandedOffset = 0;
     for (let i = 0; i < index; i++) {
-      const h = this.heights.get(all[i].id) ?? 56; // fallback 56px
+      const h = this.heights.get(all[i].id) ?? 56;
       expandedOffset += h + GAP;
     }
 
@@ -489,35 +487,43 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
     const easing = 'cubic-bezier(0.16, 1, 0.3, 1)';
     let transition = `transform 300ms ${easing}, opacity 200ms ease`;
 
+    // Collapsed stacking constants (matches real Sonner behavior):
+    // - Each toast behind the front peeks by ~6px
+    // - Very subtle scale reduction (2% per level)
+    // - Only MAX_VISIBLE toasts shown; rest hidden at last visible position
+    const PEEK = 6;    // px of card edge visible per level
+    const SCALE = 0.02; // scale reduction per level
+
     if (isEntering) {
-      // Off-screen start position
-      transform = isTop ? `translateY(-80px)` : `translateY(80px)`;
+      transform = isTop ? 'translateY(-80px)' : 'translateY(80px)';
       opacity = 0;
-      transition = 'none'; // no transition on first frame
+      transition = 'none';
     } else if (isExiting) {
-      // Slide out past edge + fade
-      const exitY = isTop ? -(expandedOffset + 80) : (expandedOffset + 80);
-      transform = `translateY(${exitY}px)`;
+      // Slide away from the stack edge
+      transform = isTop
+        ? `translateY(${-(expandedOffset + 80)}px)`
+        : `translateY(${expandedOffset + 80}px)`;
       opacity = 0;
-    } else if (hovered || total === 1) {
-      // Expanded: stack upward (bottom) or downward (top)
+    } else if (hovered) {
+      // Expanded: full stack with measured heights
       const y = isTop ? expandedOffset : -expandedOffset;
       transform = `translateY(${y}px)`;
       opacity = 1;
     } else if (index === 0) {
-      // Collapsed front
+      // Front toast — sits at anchor
       transform = 'translateY(0)';
       opacity = 1;
-    } else if (isVisible) {
-      // Collapsed peek — subtle offset + scale
-      const peekY = isTop ? (index * 8) : -(index * 8);
-      const scale = 1 - index * 0.05;
+    } else if (index < MAX_VISIBLE) {
+      // Collapsed visible: peek behind front with subtle scale
+      const peekY = (isTop ? 1 : -1) * index * PEEK;
+      const scale = 1 - index * SCALE;
       transform = `translateY(${peekY}px) scale(${scale})`;
       opacity = 1;
     } else {
-      // Beyond MAX_VISIBLE: hidden
-      const peekY = isTop ? (MAX_VISIBLE * 8) : -(MAX_VISIBLE * 8);
-      transform = `translateY(${peekY}px) scale(${1 - MAX_VISIBLE * 0.05})`;
+      // Hidden: parked at the last visible position, fully transparent
+      const peekY = (isTop ? 1 : -1) * (MAX_VISIBLE - 1) * PEEK;
+      const scale = 1 - (MAX_VISIBLE - 1) * SCALE;
+      transform = `translateY(${peekY}px) scale(${scale})`;
       opacity = 0;
     }
 
