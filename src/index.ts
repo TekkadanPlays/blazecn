@@ -61,3 +61,11 @@ export { ResizablePanelGroup, ResizablePanel, ResizableHandle } from './Resizabl
 
 // Theme
 export { ThemeToggle } from './ThemeToggle';
+export { ThemePicker } from './ThemePicker';
+export { ThemeSelector } from './ThemeSelector';
+export {
+  initTheme, applyTheme, getBaseTheme, setBaseTheme,
+  isDarkMode, setDarkMode, toggleDarkMode,
+  subscribeTheme, setThemeKeys,
+  type BaseTheme,
+} from './theme';
