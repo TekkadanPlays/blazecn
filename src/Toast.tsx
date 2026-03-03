@@ -235,6 +235,7 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
   private exitTimers = new Set<string | number>();
   private heights = new Map<string | number, number>();
   private leaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private hoverHeightFloor = 0; // never shrink wrapper during a hover session
 
   constructor(props: ToasterProps) {
     super(props);
@@ -275,15 +276,19 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
   // or when a toast exits and the DOM reflows.
   private onHoverEnter = () => {
     if (this.leaveTimer) { clearTimeout(this.leaveTimer); this.leaveTimer = null; }
-    if (!this.state.hovered) this.setState({ hovered: true });
+    if (!this.state.hovered) {
+      this.hoverHeightFloor = 0; // reset floor on fresh hover
+      this.setState({ hovered: true });
+    }
   };
 
   private onHoverLeave = () => {
     if (this.leaveTimer) clearTimeout(this.leaveTimer);
     this.leaveTimer = setTimeout(() => {
       this.leaveTimer = null;
+      this.hoverHeightFloor = 0;
       this.setState({ hovered: false });
-    }, 80);
+    }, 150); // 150ms debounce survives toast exit reflows
   };
 
   // -----------------------------------------------------------------------
@@ -448,8 +453,10 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
   // Render
   // -----------------------------------------------------------------------
 
-  // Compute total expanded stack height for the hover overlay
-  private getExpandedHeight(toasts: InternalToast[]): number {
+  // Compute total expanded stack height. Uses a floor that never shrinks
+  // during the current hover session, preventing the wrapper from
+  // collapsing below the cursor when a toast exits.
+  private getStableExpandedHeight(toasts: InternalToast[]): number {
     const count = Math.min(toasts.filter((t) => t.phase !== 'exit').length, MAX_EXPANDED);
     let total = 0;
     let shown = 0;
@@ -459,7 +466,10 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
       total += (this.heights.get(t.id) ?? 56) + (shown > 0 ? GAP : 0);
       shown++;
     }
-    return total;
+    total += GAP; // breathing room at the edge
+    // Never shrink during a hover session
+    if (total > this.hoverHeightFloor) this.hoverHeightFloor = total;
+    return this.hoverHeightFloor;
   }
 
   render() {
@@ -496,7 +506,7 @@ export class Toaster extends Component<ToasterProps, ToasterState> {
             style: {
               ...anchor,
               height: hovered
-                ? `${this.getExpandedHeight(toasts) + GAP}px`
+                ? `${this.getStableExpandedHeight(toasts)}px`
                 : `${(this.heights.get(toasts[0]?.id) ?? 56) + MAX_VISIBLE * 6 + GAP}px`,
               pointerEvents: 'auto',
               // Debug: uncomment to see the hover zone
