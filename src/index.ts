@@ -69,3 +69,11 @@ export {
   subscribeTheme, setThemeKeys,
   type BaseTheme,
 } from './theme';
+
+// Signals — reactive state bridge for InfernoJS
+export {
+  S, signal, computed, effect, batch,
+  persistedSignal, persistedStringSignal, persistedBoolSignal,
+  type Signal, type ReadonlySignal,
+} from './signals';
+
